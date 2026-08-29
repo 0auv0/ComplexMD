@@ -1,0 +1,40 @@
+seed: 42
+data:
+  root: /data/shared/zwr/GOAI/NeuralMD/data_runtime/MISATO
+  neuralmd_repo: /data/shared/zwr/GOAI/NeuralMD
+  cache: outputs/small_sample_misato_aligned/train_subset_aligned.pt
+  train_complexes: 8
+  holdout_complexes: 4
+  target_frames: [20, 40, 60]
+  history_frames: 8
+  pocket_cutoff: 12.0
+  max_pocket_residues: 128
+model:
+  generation_method: rectified_flow
+  hidden_dim: 128
+  num_heads: 4
+  num_layers: 6
+  num_rbf: 32
+  rbf_max: 20.0
+  dropout: 0.1
+  diffusion_steps: 100
+  diffusion_schedule: linear
+  max_displacement: 5.0
+  max_atomic_number: 118
+  flow_base_scale: 1.0
+  flow_time_scale: 1000.0
+  flow_solver: heun
+training:
+  steps: 1000
+  batch_size: 4
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  grad_clip: 1.0
+  history_noise_max: 0.05
+  pair_loss_weight: 0.05
+  log_every: 50
+evaluation:
+  ddim_steps: 5
+  rollout_observed_frames: 60
+  rollout_frames: 5
+output_dir: outputs/small_sample_misato_flow
