@@ -7,7 +7,7 @@ name = "complexmd"
 version = "0.1.0"
 description = "Multi-scale protein-ligand complex molecular-dynamics forecasting"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
   "numpy>=1.24",
@@ -15,8 +15,6 @@ dependencies = [
   "torch>=2.1",
   "torch-geometric>=2.4",
   "tqdm>=4.66",
-  "h5py>=3.10",
-  "MDAnalysis>=2.6",
 ]
 
 [project.optional-dependencies]

@@ -13,6 +13,7 @@ import yaml
 from bindmd.data import (
     build_goai_model_batch,
     canonicalize_goai_system,
+    fragment_project_ligand,
     load_goai_system,
     restore_full_complex,
     rigid_project_ligand,
@@ -82,6 +83,21 @@ def main() -> None:
     parser.add_argument("--history-frames", type=int)
     parser.add_argument("--sampling-steps", type=int, default=10)
     parser.add_argument("--flow-base-scale", type=float)
+    parser.add_argument(
+        "--topology-source",
+        choices=["none", "auto", "conect", "smiles"],
+        default="auto",
+        help="Use supplied SMILES when available, otherwise public PDB CONECT.",
+    )
+    parser.add_argument(
+        "--smiles-json",
+        help="Optional local {system_id: smiles or {smiles, atom_order}} mapping.",
+    )
+    parser.add_argument(
+        "--ligand-projection",
+        choices=["auto", "whole", "fragments", "none"],
+        default="auto",
+    )
     parser.add_argument("--pose-translation-scale", type=float, default=1.0)
     parser.add_argument("--pose-rotation-scale", type=float, default=1.0)
     parser.add_argument(
@@ -117,6 +133,9 @@ def main() -> None:
     if args.max_systems:
         selected = selected[: args.max_systems]
     records = []
+    smiles_catalog = (
+        json.loads(Path(args.smiles_json).read_text()) if args.smiles_json else {}
+    )
 
     for index, identifier in enumerate(selected):
         system = load_goai_system(root, args.tier, identifier)
@@ -125,7 +144,21 @@ def main() -> None:
             pocket_cutoff=args.pocket_cutoff,
             max_pocket_residues=args.max_pocket_residues,
         )
-        batch = build_goai_model_batch(canonical, history_frames)
+        smiles_record = smiles_catalog.get(identifier)
+        if isinstance(smiles_record, str):
+            smiles, smiles_atom_order = smiles_record, None
+        elif isinstance(smiles_record, dict):
+            smiles = smiles_record.get("smiles")
+            smiles_atom_order = smiles_record.get("atom_order")
+        else:
+            smiles, smiles_atom_order = None, None
+        batch = build_goai_model_batch(
+            canonical,
+            history_frames,
+            topology_source=args.topology_source,
+            smiles=smiles,
+            smiles_atom_order=smiles_atom_order,
+        )
         frames = int(system.meta["n_pred"])
         if model is None:
             predicted_heavy = batch["history"][0, -1:].expand(frames, -1, -1)
@@ -158,9 +191,26 @@ def main() -> None:
                     )[0].cpu()
                     predicted_pose_delta = None
 
-        # Only the predicted rigid pose is retained. Ligand hydrogens follow
-        # the same transform and the full PDB atom contract is restored below.
-        predicted_ligand = rigid_project_ligand(canonical, predicted_heavy)
+        projection = args.ligand_projection
+        if projection == "auto":
+            projection = (
+                "fragments"
+                if model is not None and hasattr(model, "torsion_target_scale")
+                else "whole"
+            )
+        if projection == "whole":
+            predicted_ligand = rigid_project_ligand(canonical, predicted_heavy)
+        elif projection == "fragments":
+            if "rigid_fragment" not in batch:
+                raise ValueError("fragment projection requires ligand topology")
+            predicted_ligand = fragment_project_ligand(
+                canonical, predicted_heavy, batch["rigid_fragment"][0]
+            )
+        elif projection == "none":
+            predicted_ligand = rigid_project_ligand(canonical, predicted_heavy)
+            predicted_ligand[:, canonical.ligand_heavy_local_indices] = predicted_heavy
+        else:
+            raise AssertionError(projection)
         if predicted_pose_delta is not None:
             initial_rotation = (
                 canonical.canonical_basis.T
@@ -195,6 +245,11 @@ def main() -> None:
                 "pose_mode": args.pose_mode,
                 "pose_translation_scale": args.pose_translation_scale,
                 "pose_rotation_scale": args.pose_rotation_scale,
+                "topology_source": args.topology_source,
+                "ligand_projection": projection,
+                "rigid_fragments": int(
+                    batch.get("rigid_fragment_count", torch.tensor([1]))[0]
+                ),
                 "output": str(output_path),
             }
         )

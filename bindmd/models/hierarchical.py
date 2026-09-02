@@ -9,6 +9,10 @@ from torch import nn
 
 from bindmd.models.flow import FlowBindMD
 from bindmd.models.geometry import axis_angle_to_matrix, rotation_geodesic_angle
+from bindmd.models.se3_torsion import (
+    RigidFragmentSE3TorsionFlowBindMD,
+    SE3TorsionFlowBindMD,
+)
 
 
 class PocketPoseHead(nn.Module):
@@ -20,10 +24,16 @@ class PocketPoseHead(nn.Module):
         *,
         max_translation: float,
         max_rotation_deg: float,
+        current_window_frames: int = 6,
+        historical_window_frames: int = 6,
     ):
         super().__init__()
+        if current_window_frames < 1 or historical_window_frames < 1:
+            raise ValueError("both temporal windows must contain at least one frame")
         self.max_translation = float(max_translation)
         self.max_rotation = math.radians(max_rotation_deg)
+        self.current_window_frames = int(current_window_frames)
+        self.historical_window_frames = int(historical_window_frames)
         self.pose_input = nn.Sequential(
             nn.Linear(7, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
@@ -32,6 +42,18 @@ class PocketPoseHead(nn.Module):
         )
         self.pose_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
         self.ligand_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.pose_historical_gru = nn.GRU(
+            hidden_dim, hidden_dim, batch_first=True
+        )
+        self.ligand_historical_gru = nn.GRU(
+            hidden_dim, hidden_dim, batch_first=True
+        )
+        self.pose_historical_residual = nn.Linear(
+            hidden_dim, hidden_dim, bias=False
+        )
+        self.ligand_historical_residual = nn.Linear(
+            hidden_dim, hidden_dim, bias=False
+        )
         self.output = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim * 2),
             nn.SiLU(),
@@ -40,6 +62,22 @@ class PocketPoseHead(nn.Module):
         # Zero residual is exactly hold-last and is the safest initialization.
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
+        nn.init.zeros_(self.pose_historical_residual.weight)
+        nn.init.zeros_(self.ligand_historical_residual.weight)
+
+    def _windows(
+        self, sequence: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        requested = self.current_window_frames + self.historical_window_frames
+        sequence = sequence[:, -requested:]
+        current_frames = min(self.current_window_frames, sequence.shape[1])
+        current = sequence[:, -current_frames:]
+        historical = sequence[:, :-current_frames]
+        if historical.shape[1] == 0:
+            historical = torch.zeros_like(current[:, :1])
+        elif historical.shape[1] > self.historical_window_frames:
+            historical = historical[:, -self.historical_window_frames:]
+        return historical, current
 
     def forward(
         self,
@@ -53,7 +91,13 @@ class PocketPoseHead(nn.Module):
         pose_feature = self.pose_input(
             torch.cat([pose_history, pose_valid.unsqueeze(-1).float()], dim=-1)
         )
-        _, pose_state = self.pose_gru(pose_feature)
+        pose_historical, pose_current = self._windows(pose_feature)
+        _, pose_state = self.pose_gru(pose_current)
+        _, pose_historical_state = self.pose_historical_gru(pose_historical)
+        pose_state = (
+            pose_state[-1]
+            + self.pose_historical_residual(pose_historical_state[-1])
+        )
 
         weight = ligand_mask[:, None, :, None].to(ligand_history.dtype)
         center = (ligand_history * weight).sum(dim=2) / weight.sum(dim=2).clamp_min(1.0)
@@ -67,7 +111,15 @@ class PocketPoseHead(nn.Module):
         ligand_feature = self.ligand_input(
             torch.cat([center_delta, radial.unsqueeze(-1)], dim=-1)
         )
-        _, ligand_state = self.ligand_gru(ligand_feature)
+        ligand_historical, ligand_current = self._windows(ligand_feature)
+        _, ligand_state = self.ligand_gru(ligand_current)
+        _, ligand_historical_state = self.ligand_historical_gru(
+            ligand_historical
+        )
+        ligand_state = (
+            ligand_state[-1]
+            + self.ligand_historical_residual(ligand_historical_state[-1])
+        )
 
         pocket_weight = pocket_mask.unsqueeze(-1).to(pocket_token.dtype)
         pocket_state = (pocket_token * pocket_weight).sum(dim=1) / pocket_weight.sum(
@@ -75,7 +127,7 @@ class PocketPoseHead(nn.Module):
         ).clamp_min(1.0)
         raw = torch.tanh(
             self.output(
-                torch.cat([pose_state[-1], ligand_state[-1], pocket_state], dim=-1)
+                torch.cat([pose_state, ligand_state, pocket_state], dim=-1)
             )
         )
         scale = raw.new_tensor(
@@ -95,6 +147,8 @@ class HierarchicalPoseFlowBindMD(FlowBindMD):
         pose_loss_weight: float = 1.0,
         ligand_loss_weight: float = 0.25,
         pose_rotation_loss_weight: float = 25.0,
+        current_window_frames: int = 6,
+        historical_window_frames: int = 6,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -102,6 +156,8 @@ class HierarchicalPoseFlowBindMD(FlowBindMD):
             self.hidden_dim,
             max_translation=pose_max_translation,
             max_rotation_deg=pose_max_rotation_deg,
+            current_window_frames=current_window_frames,
+            historical_window_frames=historical_window_frames,
         )
         self.pose_loss_weight = float(pose_loss_weight)
         self.ligand_loss_weight = float(ligand_loss_weight)
@@ -223,3 +279,32 @@ class HierarchicalPoseFlowBindMD(FlowBindMD):
         return torch.stack(ligand_predictions, dim=1), torch.stack(
             pose_predictions, dim=1
         )
+
+
+class HierarchicalPoseSE3TorsionFlowBindMD(
+    HierarchicalPoseFlowBindMD, SE3TorsionFlowBindMD
+):
+    """Protein-pose forecasting plus topology-constrained ligand fragments.
+
+    Cooperative inheritance intentionally reuses the verified hierarchical
+    pose objective and rollout while routing ligand training/sampling through
+    :class:`SE3TorsionFlowBindMD`. The resulting degrees of freedom are one
+    global ligand SE(3) pose and chemistry/connectivity-selected torsions; each
+    intervening atom group therefore moves as a rigid fragment.
+    """
+
+    pass
+
+
+class HierarchicalPoseRigidFragmentFlowBindMD(
+    HierarchicalPoseFlowBindMD, RigidFragmentSE3TorsionFlowBindMD
+):
+    """Joint pocket, ligand and explicit internal rigid-fragment dynamics.
+
+    The three predicted motion levels are protein-pocket SE(3), ligand-global
+    SE(3), and one relative rotation around every bond connecting two rigid
+    fragments.  Exact kinematic reconstruction guarantees that bond lengths
+    and all geometry internal to a fragment are preserved during rollout.
+    """
+
+    pass

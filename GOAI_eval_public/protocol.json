@@ -1,0 +1,91 @@
+{
+  "task": "given first N frames, predict the rest",
+  "anonymized": true,
+  "seed_for_contest_id_order": 20260814,
+  "tiers": {
+    "T1": {
+      "n_obs": 10,
+      "n_pred": 10,
+      "dt_ps": 80.0,
+      "obs": [
+        0,
+        10
+      ],
+      "pred": [
+        10,
+        20
+      ],
+      "skill": "局部动力学",
+      "n_native": 100,
+      "duration_ns": 8.0,
+      "obs_ns": 0.8,
+      "pred_ns": 0.8,
+      "ligand_resname": "MOL",
+      "n_systems": 30,
+      "source": "MISATO"
+    },
+    "T2": {
+      "n_obs": 80,
+      "n_pred": 20,
+      "dt_ps": 80.0,
+      "obs": [
+        0,
+        80
+      ],
+      "pred": [
+        80,
+        100
+      ],
+      "skill": "较充分观测下的未来预测",
+      "n_native": 100,
+      "duration_ns": 8.0,
+      "obs_ns": 6.4,
+      "pred_ns": 1.6,
+      "ligand_resname": "MOL",
+      "n_systems": 30,
+      "source": "MISATO"
+    },
+    "T3": {
+      "n_obs": 20,
+      "n_pred": 80,
+      "dt_ps": 80.0,
+      "obs": [
+        0,
+        20
+      ],
+      "pred": [
+        20,
+        100
+      ],
+      "skill": "有限观测下的长期预测",
+      "n_native": 100,
+      "duration_ns": 8.0,
+      "obs_ns": 1.6,
+      "pred_ns": 6.4,
+      "ligand_resname": "MOL",
+      "n_systems": 30,
+      "source": "MISATO"
+    },
+    "T4": {
+      "n_obs": 10,
+      "n_pred": 490,
+      "dt_ps": 1000.0,
+      "obs": [
+        0,
+        10
+      ],
+      "pred": [
+        10,
+        500
+      ],
+      "skill": "长时程稳定性与泛化能力",
+      "n_native": 500,
+      "duration_ns": 500.0,
+      "obs_ns": 10.0,
+      "pred_ns": 490.0,
+      "ligand_resname": "LIG",
+      "n_systems": 5,
+      "source": "committee_long_md"
+    }
+  }
+}

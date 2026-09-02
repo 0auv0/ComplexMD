@@ -7,6 +7,7 @@ import torch
 from bindmd.data.goai import (
     CanonicalGOAI,
     GOAISystem,
+    fragment_project_ligand,
     future_reference_poses,
     restore_full_complex,
     rigid_project_ligand,
@@ -36,7 +37,13 @@ def synthetic_canonical() -> CanonicalGOAI:
         identifier="T1-test",
         tier="T1",
         meta={"n_obs": 2, "n_pred": 2, "dt_ps": 80.0},
-        topology=SimpleNamespace(),
+        topology=SimpleNamespace(
+            bonds=[
+                (SimpleNamespace(index=3), SimpleNamespace(index=4)),
+                (SimpleNamespace(index=4), SimpleNamespace(index=5)),
+                (SimpleNamespace(index=3), SimpleNamespace(index=6)),
+            ]
+        ),
         observed_angstrom=torch.stack([full_reference, observed_last]),
         protein_indices=torch.tensor([0, 1, 2]),
         ligand_indices=torch.tensor([3, 4, 5, 6]),
@@ -85,6 +92,22 @@ def test_rigid_projection_moves_hydrogen_with_heavy_atoms() -> None:
         torch.cdist(canonical.ligand_template_canonical, canonical.ligand_template_canonical),
         atol=1e-5,
         rtol=1e-5,
+    )
+
+
+def test_fragment_projection_retains_internal_heavy_motion() -> None:
+    canonical = synthetic_canonical()
+    target_heavy = canonical.ligand_template_canonical[:3].clone()
+    target_heavy[0] += torch.tensor([0.0, 0.0, 0.5])
+    target_heavy[1:] += torch.tensor([0.3, -0.2, 0.0])
+    projected = fragment_project_ligand(
+        canonical, target_heavy.unsqueeze(0), torch.tensor([0, 1, 1])
+    )[0]
+    torch.testing.assert_close(projected[:3], target_heavy)
+    # Hydrogen atom 3 is CONECT-attached to heavy atom 0 and follows fragment 0.
+    torch.testing.assert_close(
+        projected[3] - canonical.ligand_template_canonical[3],
+        target_heavy[0] - canonical.ligand_template_canonical[0],
     )
 
 

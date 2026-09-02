@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gzip
 import json
+import multiprocessing
 import re
 import tarfile
 from pathlib import Path
@@ -22,6 +24,25 @@ INTEGER_SECTIONS = {
     "BONDS_WITHOUT_HYDROGEN",
 }
 FLOAT_SECTIONS = {"BOND_EQUIL_VALUE"}
+_WORKER_HDF5 = None
+
+
+def _initialize_worker(hdf5_path: str) -> None:
+    global _WORKER_HDF5
+    _WORKER_HDF5 = h5py.File(hdf5_path, "r")
+
+
+def _one_extracted_worker(
+    task: tuple[str, str, float]
+) -> tuple[str, dict[str, object]]:
+    identifier, path, minimum_rotatable_length = task
+    sections = parse_sections(gzip.open(path, "rb").read())
+    topology = one_topology(
+        sections, _WORKER_HDF5[identifier], minimum_rotatable_length
+    )
+    # Plain NumPy payloads avoid torch's one-shared-file-descriptor-per-tensor
+    # multiprocessing reducer, which exhausts mmap resources on full MISATO.
+    return identifier, {name: value.numpy() for name, value in topology.items()}
 
 
 def parse_sections(raw: bytes) -> dict[str, list[int] | list[float]]:
@@ -80,11 +101,17 @@ def one_topology(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--archive", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--archive")
+    source.add_argument(
+        "--extracted-root",
+        help="Directory containing <pdb_id>/production.top.gz files.",
+    )
     parser.add_argument("--hdf5", required=True)
     parser.add_argument("--aligned-cache-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--minimum-rotatable-length", type=float, default=1.38)
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 
     aligned_dir = Path(args.aligned_cache_dir)
@@ -99,24 +126,53 @@ def main() -> None:
         wanted.update(identifiers)
 
     found: dict[str, dict[str, torch.Tensor]] = {}
-    with h5py.File(args.hdf5, "r") as hdf5, tarfile.open(args.archive, mode="r|gz") as archive:
-        for member in archive:
-            if not member.isfile() or not member.name.endswith("/production.top.gz"):
-                continue
-            identifier = Path(member.name).parent.name.upper()
-            if identifier not in wanted:
-                continue
-            handle = archive.extractfile(member)
-            if handle is None:
-                continue
-            sections = parse_sections(gzip.decompress(handle.read()))
-            found[identifier] = one_topology(
-                sections,
-                hdf5[identifier],
-                args.minimum_rotatable_length,
-            )
-            if len(found) % 250 == 0:
-                print(f"parsed {len(found)}/{len(wanted)}", flush=True)
+    with h5py.File(args.hdf5, "r") as hdf5:
+        if args.extracted_root:
+            root = Path(args.extracted_root)
+            tasks = []
+            for identifier in sorted(wanted):
+                candidates = (
+                    root / identifier / "production.top.gz",
+                    root / identifier.lower() / "production.top.gz",
+                )
+                path = next((value for value in candidates if value.exists()), None)
+                if path is None:
+                    continue
+                tasks.append(
+                    (identifier, str(path), args.minimum_rotatable_length)
+                )
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=args.workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize_worker,
+                initargs=(args.hdf5,),
+            ) as executor:
+                for identifier, topology_numpy in executor.map(
+                    _one_extracted_worker, tasks, chunksize=16
+                ):
+                    found[identifier] = {
+                        name: torch.from_numpy(value)
+                        for name, value in topology_numpy.items()
+                    }
+                    if len(found) % 250 == 0:
+                        print(f"parsed {len(found)}/{len(wanted)}", flush=True)
+        else:
+            with tarfile.open(args.archive, mode="r|gz") as archive:
+                for member in archive:
+                    if not member.isfile() or not member.name.endswith("/production.top.gz"):
+                        continue
+                    identifier = Path(member.name).parent.name.upper()
+                    if identifier not in wanted:
+                        continue
+                    handle = archive.extractfile(member)
+                    if handle is None:
+                        continue
+                    sections = parse_sections(gzip.decompress(handle.read()))
+                    found[identifier] = one_topology(
+                        sections, hdf5[identifier], args.minimum_rotatable_length
+                    )
+                    if len(found) % 250 == 0:
+                        print(f"parsed {len(found)}/{len(wanted)}", flush=True)
 
     missing = sorted(wanted - found.keys())
     if missing:
@@ -128,7 +184,7 @@ def main() -> None:
         output = {
             "identifiers": identifiers,
             "cases": cases,
-            "source": str(Path(args.archive).resolve()),
+            "source": str(Path(args.archive or args.extracted_root).resolve()),
             "minimum_rotatable_length": args.minimum_rotatable_length,
         }
         torch.save(output, output_dir / f"topology_{split}.pt")
@@ -145,4 +201,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,161 +1,220 @@
-# ComplexMD：蛋白质–小分子复合物轨迹预测
+# ComplexMD
 
-ComplexMD 是 GOAI 2026「小分子–蛋白质结合轨迹预测」任务的可复现实现。模型不预测原子受力，也不数值积分牛顿方程；它在由观测帧定义的蛋白质口袋参考系中，联合预测：
+ComplexMD is a research baseline for the GOAI 2026 protein–small-molecule
+complex trajectory task. The internal Python package remains named `bindmd`
+so existing checkpoints remain directly loadable.
 
-1. 蛋白质复合物的全局 SE(3) 平移与旋转；
-2. 小分子相对口袋的条件 Rectified Flow 运动；
-3. 符合原始 PDB 原子顺序的全原子未来 XTC。
+The central choice is deliberate: **ComplexMD predicts future coordinates
+directly. It does not predict forces, and it does not integrate Newton's
+equations.**
 
-Python 包仍名为 `bindmd`，以保持已有 checkpoint 的兼容性。
+## Method
 
-## 1. 仓库结构
+BindMD combines three ideas:
+
+- NeuralMD-compatible MISATO tensors and the released NeuralMD evaluation
+  reductions, so comparisons use the same data contract.
+- ConfRover-style frame-autoregressive conditional generation: generate one
+  next frame with DDIM or conditional Rectified Flow, append it to history,
+  and repeat.
+- STAR-MD-style joint space-time processing: atom-frame tokens interact in a
+  single causal attention operation, with separate rotary phases for atom and
+  frame indices and small contextual perturbations during training.
+
+For a history \(x_{t-H:t}\), the generated variable is the next-frame
+displacement
+
+\[
+\Delta x_{t+1} = x_{t+1} - x_t.
+\]
+
+The vector-field/denoising network sees historical ligand coordinates, a
+candidate displacement along the probability path, ligand atom identity/mass,
+and a cropped fixed protein pocket.
+Its vector output is assembled from relative ligand–ligand, ligand–backbone,
+and temporal directions. This makes the output SE(3)-equivariant while all
+attention features remain invariant.
+
+This implementation is inspired by, but not a copy of:
+
+- [STAR-MD](https://arxiv.org/abs/2602.02128), especially causal joint
+  spatio-temporal attention, two-axis position encoding, and contextual noise.
+- [ConfRover](https://github.com/ByteDance-Seed/ConfRover), especially
+  autoregressive frame conditioning and a diffusion structure decoder.
+- [NeuralMD](https://github.com/chao1224/NeuralMD), for the semi-flexible
+  protein–ligand data representation and baseline metrics.
+
+## What differs from those systems
+
+STAR-MD models protein residue frames and uses OpenFold representations.
+BindMD instead models ligand heavy atoms conditioned on fixed protein N/CA/C
+backbone geometry. ConfRover alternates a spatial Pairformer with a temporal
+language model; BindMD uses one joint atom-frame attention graph. NeuralMD
+learns acceleration/force-like dynamics and numerically integrates them;
+BindMD samples coordinate displacements.
+
+The current implementation uses a bounded history window instead of a KV
+cache. This keeps the first baseline compact and makes T1/T2/T3 evaluation
+unambiguous.
+
+## Repository layout
 
 ```text
-ComplexMD/
-├── README.md
-├── run.sh                         # 无参数一键推理入口
-├── environment.yml               # 推荐且唯一的主环境安装方式
-├── checkpoints/epoch_015.pt      # 最终推理权重
-├── configs/complexmd_inference.yaml
-├── bindmd/                        # 数据、模型和指标实现
-├── scripts/predict_goai.py        # 全原子 XTC 推理
-├── scripts/validate_goai_submission.py
-├── scripts/package_submission.py
-├── tests/
-└── docs/
+bindmd/data/misato.py        NeuralMD processed-data adapter and causal centering
+bindmd/data/goai.py          GOAI loading, frame fixing, full-complex restoration
+bindmd/models/layers.py      joint space-time attention, 2D RoPE, pocket encoder
+bindmd/models/bindmd.py      equivariant denoiser, training objective, rollout
+bindmd/models/flow.py        conditional Flow Matching and rigid/internal projection
+bindmd/evaluation/metrics.py NeuralMD metrics plus Geo/Phys/Dyn/Stab proxies
+scripts/train.py             training entry point
+scripts/evaluate.py          T1/T2/T3 rollout evaluation
+scripts/predict_goai.py      competition-format all-atom XTC generation
+scripts/select_rigid_hparams.py validation-only rigid/Flow hyperparameter selection
+scripts/compare_rigid_results.py unified Flow/DDIM/NeuralMD/persistence comparison
+tests/                       shape, metric, and SE(3)-equivariance tests
 ```
 
-本仓库不包含 MISATO、GOAI 评测数据、训练缓存或预测答案。
+## Data
 
-## 2. 环境安装
+BindMD consumes the files produced by NeuralMD's
+`DatasetMISATOSemiFlexibleMultiTrajectory`:
 
-唯一推荐安装方式为 Conda。已验证环境为 Linux、Python 3.9.25、PyTorch 2.2.0、CUDA 12.1、PyG 2.5.2 和 MDAnalysis 2.7.0。
+```text
+MISATO/
+└── processed_semi_flexible/
+    ├── geometric_data_processed_train.pt
+    ├── geometric_data_processed_val.pt
+    └── geometric_data_processed_test.pt
+```
+
+The configured server location is:
+
+```text
+/data/shared/zwr/GOAI/NeuralMD/data_runtime/MISATO
+```
+
+NeuralMD's cached coordinates were globally centred using all 100 frames.
+BindMD subtracts the fixed protein CA centroid from both protein and ligand
+coordinates at load time. That cancels the cached global offset and prevents
+future ligand frames from supplying the model's coordinate origin. Pocket
+cropping uses only the last observed frame.
+
+At present, `val` and `test` are processed on the server; process the NeuralMD
+`train` split before a full run.
+
+## Installation and checks
+
+The existing Geom3D environment already contains the required PyTorch and PyG
+versions:
 
 ```bash
-conda env create -f environment.yml
-conda activate complexmd
-pip install -e . --no-deps
+cd /data/shared/zwr/GOAI/BindMD
+/data2/users/zwruu45/.conda_envs/Geom3D/bin/pip install -e . --no-deps
+/data2/users/zwruu45/.conda_envs/Geom3D/bin/python -m pytest -q
 ```
 
-最低建议硬件：1 张支持 CUDA 的 GPU、16 GB 显存、4 核 CPU、32 GB 内存和 10 GB 可用磁盘。最终实验使用 NVIDIA A100 40 GB。CPU 可以加载代码，但完整 T3 推理不建议使用 CPU。
-
-## 3. 评测数据准备
-
-评测数据由赛事组委会提供，任务定义以评测包中的 `README.md` 和 `protocol.json` 为准。将公开或独立核验数据放到仓库根目录：
-
-```text
-GOAI_eval_public/
-├── protocol.json
-├── T1/ids.txt
-├── T1/T1-1/T1-1.pdb
-├── T1/T1-1/T1-1_obs.xtc
-├── T1/T1-1/meta.json
-├── T2/...
-└── T3/...
-```
-
-`run.sh` 会依次自动查找：
-
-1. 环境变量 `GOAI_INPUT_ROOT` 指向的位置；
-2. 仓库根目录下的 `GOAI_eval_public/`；
-3. `/data/GOAI_eval_public/`。
-
-正常复现时无需修改任何源码或脚本参数。
-
-## 4. 权重与关键配置
-
-- 权重：`checkpoints/epoch_015.pt`
-- SHA256：`96fff72a87d7c9a7b24f59501a317f8443b2a1fb612b7c6e2602a1739f871616`
-- 配置：`configs/complexmd_inference.yaml`
-- 随机种子：42；对第 `i` 个体系使用 `42 + i`
-- Flow 求解器：Heun，10 个采样步
-- 蛋白质位姿平移残差缩放：0.25
-- 蛋白质位姿旋转残差缩放：0.25
-- 小分子内部形变缩放：0，即当前版本保持内部刚性
-
-权重约 30 MB。`.gitattributes` 已将 `*.pt` 配置为 Git LFS 文件；若 GitHub 仓库不使用 LFS，也可将权重上传为固定 Release 资产，但必须保持上述文件名和 SHA256，或同步修改 README 与 `run.sh` 中的稳定下载逻辑。
-
-## 5. 一键推理
-
-组委会只需从仓库根目录执行：
+Inspect one real complex:
 
 ```bash
-bash run.sh
+/data2/users/zwruu45/.conda_envs/Geom3D/bin/python scripts/inspect_data.py \
+  --root /data/shared/zwr/GOAI/NeuralMD/data_runtime/MISATO \
+  --split val
 ```
 
-脚本全程非交互，依次完成：
-
-```text
-环境/权重/数据自检
-→ 读取观测轨迹
-→ 口袋对齐和条件编码
-→ T1、T2、T3 递推预测
-→ 恢复完整蛋白质与小分子坐标
-→ 写出 nm 单位 XTC
-→ 校验帧数、原子数和有限坐标
-→ 生成材料 A 压缩包
-```
-
-可选的 `GOAI_INPUT_ROOT`、`COMPLEXMD_OUTPUT_ROOT` 和 `COMPLEXMD_PYTHON` 环境变量只用于不同机器的路径适配；默认目录结构下无需设置。
-
-## 6. 运行产物
-
-成功后生成：
-
-```text
-predictions/
-├── T1/T1-1_pred.xtc ... T1-30_pred.xtc
-├── T2/T2-1_pred.xtc ... T2-30_pred.xtc
-├── T3/T3-1_pred.xtc ... T3-30_pred.xtc
-└── validation.json
-
-GOAI_pred_COMPLEXMD.zip
-```
-
-压缩包第一层直接是 `T1/`、`T2/`、`T3/`，只包含 90 条 `*_pred.xtc`，不含额外父目录、观测帧或缓存文件。T1、T2、T3 的未来帧数分别为 10、20、80，原子数和顺序与对应 PDB 完全一致，XTC 单位为 nm。正式提交时请按队伍 ID 将压缩包改名为 `GOAI_pred_<队伍ID>.zip`。
-
-在 A100 40 GB 上的实测参考耗时为：T1 约 2 分钟、T2 约 3–5 分钟、T3 约 14–18 分钟，单 GPU 完整运行约 20–25 分钟。不同体系原子数和磁盘性能会影响耗时。
-
-## 7. 方法与推理流程
-
-每个观测体系首先使用蛋白质口袋骨架对所有帧做 Kabsch 对齐，并以第一帧定义唯一参考方向。模型由口袋编码器、联合时空注意力模块、小分子条件 Flow 头和蛋白质位姿头组成。
-
-小分子头直接学习从简单基分布到下一帧真实相对位移的连续速度场；蛋白质头预测相邻帧的平移和轴角旋转增量。推理时递推生成未来帧，再将预测的全局 SE(3) 变换作用于完整蛋白质和小分子。小分子重原子确定一个刚体变换，氢原子跟随同一变换。整个流程只读取 PDB、`meta.json` 和 `*_obs.xtc`，不会读取或检索未来轨迹。
-
-## 8. 训练数据与外部资源披露
-
-- 训练数据：MISATO 的 NeuralMD 半柔性预处理表示；13,066 个训练体系、1,357 个验证体系、1,357 个测试体系。
-- 划分：沿用 NeuralMD/MISATO 固定划分；GOAI 评测体系及其未来帧未参与训练或调参。
-- 基础模型：无预训练基础模型。
-- 外部势函数：无。
-- 外部 MD 数据：除上述 MISATO 训练轨迹外无其他 MD 数据。
-- 方法参考：NeuralMD 的数据契约与评估指标、STAR-MD 的联合时空建模思想、ConfRover 的自回归条件结构生成思想。本仓库实现为独立代码，并未复制未开源的 STAR-MD 仓库。
-- 许可证：本代码使用 MIT License。MISATO、NeuralMD、ConfRover 和赛事评测数据不在本仓库再分发，使用者应分别遵循其官方来源和许可证/使用条款。
-
-## 9. 自检与测试
-
-`run.sh` 在推理前检查 Python、CUDA、数据目录、T1–T3 的 `ids.txt`、配置文件以及 checkpoint SHA256；推理后逐条读回 90 个 XTC，检查帧数、原子数和 NaN/Inf，并只在全部通过后打包。
-
-独立单元测试运行方式：
+Run a short overfit/smoke training job on the processed validation data:
 
 ```bash
-python -m pytest -q
+/data2/users/zwruu45/.conda_envs/Geom3D/bin/python scripts/train.py \
+  --config configs/bindmd_base.yaml --split val --max-steps 20
 ```
 
-当前测试覆盖坐标对齐、SE(3) 几何、Flow、分层位姿头、指标和赛事 XTC 输出契约。
+For full training, omit `--split val --max-steps 20` after the train cache has
+been generated.
 
-## 10. 已知限制与常见问题
+Run the reproducible MISATO train-split small-sample experiment:
 
-- 当前小分子内部形变被设为零，因此能稳定保持键长，但不能显式生成真实扭转角变化。
-- 蛋白质内部结构使用第一帧模板，只预测复合物全局平移和旋转；不预测口袋内部柔性。
-- 长时程 T3 会积累旋转误差，位姿残差缩放 0.25 是验证集选择的保守设置。
-- 公开评测包没有未来真值，因此本仓库只能做观测段因果回测，不能提前给出官方隐藏测试分数。
-- 若报 checkpoint 哈希错误，请确认 Git LFS 已执行 `git lfs pull`，而不是只下载到了 LFS 指针文件。
-- 若 MDAnalysis 读取 XTC 报原子数不一致，请确认 PDB、观测 XTC 与 `meta.json` 来自同一个评测体系且未改动原子顺序。
+```bash
+PYTHONPATH=.:/data:/data/shared/zwr/GOAI/NeuralMD \
+  /data2/users/zwruu45/.conda_envs/Geom3D/bin/python \
+  scripts/prepare_small_misato.py --config configs/small_sample.yaml
 
-完整阶段结果见 `docs/RESULTS.md`，架构细节见 `docs/DESIGN.md`。
+CUDA_VISIBLE_DEVICES=6 \
+PYTHONPATH=.:/data:/data/shared/zwr/GOAI/NeuralMD \
+  /data2/users/zwruu45/.conda_envs/Geom3D/bin/python \
+  scripts/small_sample_experiment.py --config configs/small_sample_clean.yaml
+```
 
-## 11. 结果摘要
+The measured setup, metrics, periodic-boundary artifact, and conclusions are
+documented in [`docs/SMALL_SAMPLE_RESULTS.md`](docs/SMALL_SAMPLE_RESULTS.md).
 
-在 1,357 个 MISATO 测试复合物上，ComplexMD 在 T1/T2/T3 协议下的 RMSE 分别为 1.2244、1.4277 和 2.0323；旧 BindMD 为 1.2337、1.4468 和 2.1150；NeuralMD 为 2.1738、2.7992 和 4.8086。比较边界和完整指标见 `docs/RESULTS.md`。
+## Evaluation
 
+```bash
+/data2/users/zwruu45/.conda_envs/Geom3D/bin/python scripts/evaluate.py \
+  --config configs/bindmd_base.yaml \
+  --checkpoint outputs/checkpoints/last.pt \
+  --scenario all
+```
+
+The scenarios are:
+
+- T1 proxy: observe 50 frames, predict 50.
+- T2: observe 80 frames, predict 20.
+- T3: observe 20 frames, predict 80.
+
+Every evaluation JSON contains the original NeuralMD MAE, RMSE, matching,
+stability, ligand-collision, and binding-collision reductions, followed by raw
+Geo/Phys/Dyn/Stab proxy metrics. Official competition normalization constants
+are not public, so no unofficial scalar "competition score" is fabricated.
+
+### Public GOAI package and XTC output
+
+The public adapter Kabsch-aligns every observed pocket backbone to frame 0.
+Inside the model, all protein atoms are therefore represented by the complete
+frame-0 rigid template, and the ligand is generated in the same fixed frame.
+Before writing the final XTC, an observed-only global protein pose is applied
+to both the protein and ligand. The default `hold_last` policy uses the last
+observed pose; `constant_velocity` extrapolates a clipped pose velocity fitted
+only from observations. Neither policy reads future targets.
+
+The ligand-heavy prediction determines a single rigid SE(3) pose, which is
+also applied to ligand hydrogens. T4 ions persist from the last observation.
+The output retains the PDB atom order, contains exactly `n_pred` frames, and is
+written in XTC's nm convention.
+
+```bash
+PYTHONPATH=. /data2/users/zwruu45/.conda_envs/Geom3D/bin/python \
+  scripts/predict_goai.py \
+  --input-root GOAI_eval_public \
+  --output-dir outputs/goai_public \
+  --tier T1 \
+  --checkpoint outputs/misato_aligned_full_flow/checkpoints/last.pt \
+  --config configs/bindmd_full_flow_rigid.yaml \
+  --pose-mode hold_last
+```
+
+Use `--ligand-mode persistence` for a checkpoint-free output-contract smoke
+test. XTC I/O supports either `mdtraj` or `MDAnalysis`.
+
+The full 1,357-complex rigid/internal Flow experiment, validation-only
+hyperparameter protocol, audited T1/T2/T3 tables, and comparison with original
+Flow, DDIM, NeuralMD and persistence are documented in
+[`docs/RIGID_INTERNAL_RESULTS.md`](docs/RIGID_INTERNAL_RESULTS.md). The method
+separates a ligand's rigid translation/rotation relative to the aligned pocket
+from its internal Cartesian deformation; it is not a second protein-frame
+alignment.
+
+## Current limitations
+
+- Protein internal coordinates are fixed to frame 0. Future global pose is
+  held at the last observation unless observed-only extrapolation is selected.
+- MISATO processed tensors contain ligand heavy atoms and protein backbone but
+  no explicit ligand bond graph, charges, stereochemistry, hydrogens, or
+  force-field parameters. Bond and clash metrics are therefore proxies.
+- Autoregressive Flow/DDIM sampling is much slower than a deterministic
+  one-step head, especially for T3. Distillation, cached history and dynamic
+  batching are natural next steps.
+- The best current inference projection uses zero internal-deformation scale.
+  It preserves ligand geometry and still predicts rigid motion, but cannot
+  model genuine torsional changes. A trained SE(3)-plus-torsion decoder is the
+  next architectural step.

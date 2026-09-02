@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ from bindmd.data.alignment import (
     first_residue_frame,
     kabsch_transform,
     pose_deltas_from_alignment,
+)
+from bindmd.data.topology import (
+    build_torsion_topology_from_connectivity,
+    build_torsion_topology_from_smiles,
 )
 
 
@@ -277,7 +282,12 @@ def canonicalize_goai_system(
 
 
 def build_goai_model_batch(
-    canonical: CanonicalGOAI, history_frames: int
+    canonical: CanonicalGOAI,
+    history_frames: int,
+    *,
+    topology_source: str = "auto",
+    smiles: str | None = None,
+    smiles_atom_order: list[int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Construct the single-system batch expected by existing ComplexMD weights."""
 
@@ -307,7 +317,7 @@ def build_goai_model_batch(
         )
     pose_history = pose_history.clone()
     pose_history[~pose_history_valid] = 0.0
-    return {
+    result = {
         "history": history.unsqueeze(0),
         "ligand_z": ligand_z.unsqueeze(0),
         "ligand_mass": ligand_mass.unsqueeze(0),
@@ -322,6 +332,58 @@ def build_goai_model_batch(
         "pocket_pose_history": pose_history.unsqueeze(0),
         "pocket_pose_history_valid": pose_history_valid.unsqueeze(0),
     }
+    if topology_source not in {"none", "auto", "conect", "smiles"}:
+        raise ValueError("topology_source must be none, auto, conect, or smiles")
+    if topology_source != "none":
+        supplied_smiles = smiles or system.meta.get("smiles")
+        topology = None
+        if topology_source in {"auto", "smiles"} and supplied_smiles:
+            try:
+                topology = build_torsion_topology_from_smiles(
+                    str(supplied_smiles), model_atom_order=smiles_atom_order
+                )
+                if topology["rigid_fragment"].numel() != ligand_z.numel():
+                    raise ValueError("SMILES and ligand heavy-atom counts disagree")
+            except Exception:
+                if topology_source == "smiles":
+                    raise
+                topology = None
+        if topology is None and topology_source in {"auto", "conect"}:
+            full_to_heavy = {
+                int(atom): local
+                for local, atom in enumerate(system.ligand_heavy_indices.tolist())
+            }
+            compact_bonds = []
+            topology_bonds = getattr(system.topology, "bonds", [])
+            topology_bonds = topology_bonds() if callable(topology_bonds) else topology_bonds
+            for bond in list(topology_bonds):
+                atoms = getattr(bond, "atoms", bond)
+                if len(atoms) != 2:
+                    continue
+                left = int(getattr(atoms[0], "index", atoms[0]))
+                right = int(getattr(atoms[1], "index", atoms[1]))
+                if left in full_to_heavy and right in full_to_heavy:
+                    compact_bonds.append((full_to_heavy[left], full_to_heavy[right]))
+            topology = build_torsion_topology_from_connectivity(
+                ligand_z.tolist(), history[-1], compact_bonds
+            )
+        if topology is not None:
+            torsions = topology["torsion_bond"].shape[0]
+            bonds = topology["bond_index"].shape[0]
+            result.update(
+                {
+                    "bond_index": topology["bond_index"].unsqueeze(0),
+                    "bond_mask": torch.ones(1, bonds, dtype=torch.bool),
+                    "torsion_bond": topology["torsion_bond"].unsqueeze(0),
+                    "torsion_quad": topology["torsion_quad"].unsqueeze(0),
+                    "torsion_rotate_mask": topology["torsion_rotate_mask"].unsqueeze(0),
+                    "torsion_mask": torch.ones(1, torsions, dtype=torch.bool),
+                    "torsion_root": topology["torsion_root"].unsqueeze(0),
+                    "rigid_fragment": topology["rigid_fragment"].unsqueeze(0),
+                    "rigid_fragment_count": topology["rigid_fragment_count"].unsqueeze(0),
+                }
+            )
+    return result
 
 
 def rigid_project_ligand(
@@ -340,6 +402,80 @@ def rigid_project_ligand(
             apply_rigid_transform(template_all, rotation, mobile_center, target_center)
         )
     return torch.stack(projected)
+
+
+def fragment_project_ligand(
+    canonical: CanonicalGOAI,
+    predicted_heavy: torch.Tensor,
+    rigid_fragment: torch.Tensor,
+) -> torch.Tensor:
+    """Move ligand hydrogens with their nearest topology-defined rigid piece.
+
+    Predicted heavy atoms are retained exactly. Each hydrogen follows the
+    Kabsch transform of the rigid heavy-atom fragment to which its CONECT path
+    belongs, avoiding the old whole-ligand projection that erased torsions.
+    """
+
+    rigid_fragment = rigid_fragment.long().cpu()
+    if rigid_fragment.numel() != canonical.ligand_heavy_local_indices.numel():
+        raise ValueError("rigid_fragment must label every ligand heavy atom")
+    template_all = canonical.ligand_template_canonical
+    heavy_local = canonical.ligand_heavy_local_indices
+    full_global = canonical.system.ligand_indices.tolist()
+    global_to_local = {int(value): index for index, value in enumerate(full_global)}
+    full_labels = torch.full((len(full_global),), -1, dtype=torch.long)
+    for heavy_index, local_index in enumerate(heavy_local.tolist()):
+        full_labels[local_index] = rigid_fragment[heavy_index]
+
+    adjacency = [set() for _ in full_global]
+    topology_bonds = getattr(canonical.system.topology, "bonds", [])
+    topology_bonds = topology_bonds() if callable(topology_bonds) else topology_bonds
+    for bond in list(topology_bonds):
+        atoms = getattr(bond, "atoms", bond)
+        if len(atoms) != 2:
+            continue
+        left = int(getattr(atoms[0], "index", atoms[0]))
+        right = int(getattr(atoms[1], "index", atoms[1]))
+        if left in global_to_local and right in global_to_local:
+            left, right = global_to_local[left], global_to_local[right]
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+    queue = deque(int(index) for index in torch.nonzero(full_labels >= 0).flatten())
+    while queue:
+        node = queue.popleft()
+        for neighbor in adjacency[node]:
+            if int(full_labels[neighbor]) < 0:
+                full_labels[neighbor] = full_labels[node]
+                queue.append(neighbor)
+    for index in torch.nonzero(full_labels < 0).flatten().tolist():
+        nearest = torch.cdist(
+            template_all[index:index + 1], template_all[heavy_local]
+        ).argmin()
+        full_labels[index] = rigid_fragment[int(nearest)]
+
+    output = []
+    for target_heavy in predicted_heavy:
+        frame = template_all.clone()
+        for fragment in torch.unique(rigid_fragment).tolist():
+            fragment_heavy = torch.nonzero(
+                rigid_fragment == fragment, as_tuple=False
+            ).flatten()
+            fragment_all = torch.nonzero(
+                full_labels == fragment, as_tuple=False
+            ).flatten()
+            source = template_all[heavy_local[fragment_heavy]]
+            target = target_heavy[fragment_heavy]
+            if fragment_heavy.numel() == 1:
+                moved = template_all[fragment_all] + (target[0] - source[0])
+            else:
+                rotation, mobile_center, target_center = kabsch_transform(source, target)
+                moved = apply_rigid_transform(
+                    template_all[fragment_all], rotation, mobile_center, target_center
+                )
+            frame[fragment_all] = moved
+        frame[heavy_local] = target_heavy
+        output.append(frame)
+    return torch.stack(output)
 
 
 def _skew(vector: torch.Tensor) -> torch.Tensor:

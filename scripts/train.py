@@ -49,6 +49,7 @@ def main() -> None:
             data_config["aligned_cache_dir"],
             args.split,
             data_config.get("topology_cache_dir"),
+            data_config.get("qm_hdf5"),
         )
     else:
         base = MISATOProcessedDataset(data_config["root"], args.split)
@@ -80,7 +81,10 @@ def main() -> None:
         payload = torch.load(args.initialize, map_location="cpu")
         state = payload["model"] if "model" in payload else payload
         missing, unexpected = model.load_state_dict(state, strict=False)
-        permitted_missing = all(name.startswith("pose_head.") for name in missing)
+        permitted_missing = all(
+            name.startswith(("pose_head.", "fragment_torsion_head."))
+            for name in missing
+        )
         if unexpected or (missing and not permitted_missing):
             raise RuntimeError(
                 f"initial checkpoint mismatch: missing={missing}, unexpected={unexpected}"
@@ -109,18 +113,40 @@ def main() -> None:
             if config["model"].get("generation_method") in {
                 "flow", "rectified_flow", "flow_matching", "se3_torsion",
                 "se3_torsion_flow", "hierarchical_pose", "hierarchical_pose_flow",
+                "hierarchical_pose_se3_torsion",
+                "hierarchical_pose_se3_torsion_flow",
+                "rigid_fragment", "rigid_fragment_flow",
+                "hierarchical_pose_rigid_fragment",
+                "hierarchical_pose_rigid_fragment_flow",
             }
             else "diffusion_loss"
         )
         running = {"loss": 0.0, objective_name: 0.0, "pair_loss": 0.0}
         if config["model"].get("generation_method") in {
-            "hierarchical_pose", "hierarchical_pose_flow"
+            "hierarchical_pose", "hierarchical_pose_flow",
+            "hierarchical_pose_se3_torsion",
+            "hierarchical_pose_se3_torsion_flow",
+            "hierarchical_pose_rigid_fragment",
+            "hierarchical_pose_rigid_fragment_flow",
         }:
             running.update(
                 {
                     "pose_loss": 0.0,
                     "pose_translation_loss": 0.0,
                     "pose_rotation_loss": 0.0,
+                }
+            )
+        if config["model"].get("generation_method") in {
+            "rigid_fragment", "rigid_fragment_flow",
+            "hierarchical_pose_rigid_fragment",
+            "hierarchical_pose_rigid_fragment_flow",
+        }:
+            running.update(
+                {
+                    "torsion_confidence_loss": 0.0,
+                    "torsion_active_rate": 0.0,
+                    "torsion_confidence_mean": 0.0,
+                    "torsion_predicted_active_rate": 0.0,
                 }
             )
         for batch_index, batch in enumerate(loader):

@@ -6,9 +6,12 @@ import random
 from pathlib import Path
 from typing import Any
 
+import h5py
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.data import InMemoryDataset
+
+from bindmd.data.topology import build_torsion_topology_from_qm_group
 
 
 class MISATOProcessedDataset(InMemoryDataset):
@@ -46,6 +49,7 @@ class MISATOAlignedDataset(Dataset):
         cache_dir: str | Path,
         split: str,
         topology_cache_dir: str | Path | None = None,
+        qm_hdf5: str | Path | None = None,
     ):
         self.split = split
         self.path = Path(cache_dir) / f"aligned_{split}.pt"
@@ -58,6 +62,8 @@ class MISATOAlignedDataset(Dataset):
         self.cases = payload["cases"]
         if len(self.identifiers) != len(self.cases):
             raise ValueError(f"corrupt aligned cache: {self.path}")
+        if topology_cache_dir is not None and qm_hdf5 is not None:
+            raise ValueError("choose topology_cache_dir or qm_hdf5, not both")
         if topology_cache_dir is not None:
             topology_path = Path(topology_cache_dir) / f"topology_{split}.pt"
             topology = torch.load(topology_path)
@@ -70,6 +76,26 @@ class MISATOAlignedDataset(Dataset):
             for case, fields in zip(self.cases, topology["cases"]):
                 for name, value in fields.items():
                     setattr(case, name, value)
+        elif qm_hdf5 is not None:
+            qm_path = Path(qm_hdf5)
+            if not qm_path.exists():
+                raise FileNotFoundError(f"Missing QM topology source {qm_path}")
+            with h5py.File(qm_path, "r") as qm:
+                for identifier, case in zip(self.identifiers, self.cases):
+                    key = str(identifier).upper()
+                    if key not in qm:
+                        raise KeyError(f"{key} is absent from {qm_path}")
+                    expected = case.ligand_x.long() + 1
+                    topology = build_torsion_topology_from_qm_group(
+                        qm[key], model_atomic_numbers=expected
+                    )
+                    observed = topology.pop("topology_atomic_numbers")
+                    if not torch.equal(expected.cpu(), observed.cpu()):
+                        raise ValueError(
+                            f"{key}: QM and aligned ligand atom order disagree"
+                        )
+                    for name, value in topology.items():
+                        setattr(case, name, value)
 
     def __len__(self) -> int:
         return len(self.cases)
@@ -120,6 +146,9 @@ def prepare_complex(
             "torsion_quad",
             "torsion_rotate_mask",
             "torsion_root",
+            "rigid_fragment",
+            "rigid_fragment_count",
+            "ligand_hybridisation",
             "pocket_pose_delta",
             "pocket_pose_valid",
             "pocket_world_rotation",
@@ -257,6 +286,7 @@ def collate_bindmd(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
     pocket_mask = torch.zeros(batch_size, max_pocket, dtype=torch.bool)
     target_index = torch.zeros(batch_size, dtype=torch.long)
     has_topology = "torsion_bond" in items[0]
+    has_fragments = "rigid_fragment" in items[0]
     has_pose = "pocket_pose_history" in items[0]
     if has_pose:
         pocket_pose_history = torch.zeros(batch_size, history_frames, 6)
@@ -277,6 +307,16 @@ def collate_bindmd(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
         )
         torsion_mask = torch.zeros(batch_size, max_torsions, dtype=torch.bool)
         torsion_root = torch.zeros(batch_size, dtype=torch.long)
+    if has_fragments:
+        max_fragments = max(int(item["rigid_fragment_count"]) for item in items)
+        rigid_fragment = torch.zeros(batch_size, max_ligand, dtype=torch.long)
+        rigid_fragment_count = torch.zeros(batch_size, dtype=torch.long)
+        rigid_fragment_mask = torch.zeros(
+            batch_size, max_fragments, dtype=torch.bool
+        )
+        ligand_hybridisation = torch.zeros(
+            batch_size, max_ligand, dtype=torch.long
+        )
 
     for i, item in enumerate(items):
         n_ligand = item["ligand_z"].shape[0]
@@ -309,6 +349,15 @@ def collate_bindmd(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
             ] = item["torsion_rotate_mask"]
             torsion_mask[i, :n_torsions] = True
             torsion_root[i] = item["torsion_root"]
+        if has_fragments:
+            fragment_count = int(item["rigid_fragment_count"])
+            rigid_fragment[i, :n_ligand] = item["rigid_fragment"]
+            rigid_fragment_count[i] = fragment_count
+            rigid_fragment_mask[i, :fragment_count] = True
+            if "ligand_hybridisation" in item:
+                ligand_hybridisation[i, :n_ligand] = item[
+                    "ligand_hybridisation"
+                ]
 
     result = {
         "history": history,
@@ -333,6 +382,15 @@ def collate_bindmd(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
                 "torsion_rotate_mask": torsion_rotate_mask,
                 "torsion_mask": torsion_mask,
                 "torsion_root": torsion_root,
+            }
+        )
+    if has_fragments:
+        result.update(
+            {
+                "rigid_fragment": rigid_fragment,
+                "rigid_fragment_count": rigid_fragment_count,
+                "rigid_fragment_mask": rigid_fragment_mask,
+                "ligand_hybridisation": ligand_hybridisation,
             }
         )
     if has_pose:

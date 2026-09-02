@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -19,7 +20,11 @@ from bindmd.data import (
 )
 from bindmd.evaluation.metrics import compute_all_metrics, finite_mean
 from bindmd.models import build_model
-from bindmd.models.geometry import integrate_pose_deltas, rotation_geodesic_angle
+from bindmd.models.geometry import (
+    dihedral,
+    integrate_pose_deltas,
+    rotation_geodesic_angle,
+)
 
 
 SCENARIOS = {
@@ -104,6 +109,65 @@ def coordinate_summary(
     }
 
 
+def fragment_motion_metrics(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    reference: torch.Tensor,
+    raw,
+) -> dict[str, float]:
+    """Metrics specific to the explicit rigid-fragment representation."""
+
+    result = {
+        "fragment_torsion_angle_mae_deg": float("nan"),
+        "fragment_torsion_delta_mae_deg": float("nan"),
+        "fragment_internal_distance_rmse": float("nan"),
+        "fragment_reference_drift_rmse": float("nan"),
+    }
+    if not hasattr(raw, "rigid_fragment"):
+        return result
+    fragment = raw.rigid_fragment.to(predicted.device)
+    pair_mask = fragment[:, None] == fragment[None, :]
+    pair_mask &= torch.triu(
+        torch.ones_like(pair_mask, dtype=torch.bool), diagonal=1
+    )
+    if bool(pair_mask.any()):
+        predicted_distance = torch.cdist(predicted, predicted)
+        target_distance = torch.cdist(target, target)
+        reference_distance = torch.cdist(reference[None], reference[None])[0]
+        target_error = predicted_distance[:, pair_mask] - target_distance[:, pair_mask]
+        reference_error = (
+            predicted_distance[:, pair_mask] - reference_distance[pair_mask]
+        )
+        result["fragment_internal_distance_rmse"] = float(
+            target_error.square().mean().sqrt()
+        )
+        result["fragment_reference_drift_rmse"] = float(
+            reference_error.square().mean().sqrt()
+        )
+
+    if hasattr(raw, "torsion_quad") and raw.torsion_quad.shape[0]:
+        quad = raw.torsion_quad.to(predicted.device)
+        frame_quad = quad[None].expand(predicted.shape[0], -1, -1)
+        predicted_angle = dihedral(predicted, frame_quad)
+        target_angle = dihedral(target, frame_quad)
+        reference_angle = dihedral(reference[None], quad[None])[0]
+
+        def wrapped(value: torch.Tensor) -> torch.Tensor:
+            return torch.atan2(torch.sin(value), torch.cos(value))
+
+        angle_error = wrapped(predicted_angle - target_angle).abs()
+        predicted_delta = wrapped(predicted_angle - reference_angle[None])
+        target_delta = wrapped(target_angle - reference_angle[None])
+        delta_error = wrapped(predicted_delta - target_delta).abs()
+        result["fragment_torsion_angle_mae_deg"] = float(
+            torch.rad2deg(angle_error).mean()
+        )
+        result["fragment_torsion_delta_mae_deg"] = float(
+            torch.rad2deg(delta_error).mean()
+        )
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/bindmd_base.yaml")
@@ -116,6 +180,11 @@ def main() -> None:
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument("--internal-deformation-scale", type=float)
     parser.add_argument("--flow-base-scale", type=float)
+    parser.add_argument("--torsion-base-scale", type=float)
+    parser.add_argument("--torsion-step-limit-deg", type=float)
+    parser.add_argument("--torsion-confidence-threshold", type=float)
+    parser.add_argument("--translation-step-limit", type=float)
+    parser.add_argument("--rotation-step-limit-deg", type=float)
     parser.add_argument("--pose-translation-scale", type=float, default=1.0)
     parser.add_argument("--pose-rotation-scale", type=float, default=1.0)
     parser.add_argument("--output")
@@ -141,6 +210,11 @@ def main() -> None:
     is_flow = generation_method in {
         "flow", "rectified_flow", "flow_matching", "se3_torsion",
         "se3_torsion_flow", "hierarchical_pose", "hierarchical_pose_flow",
+        "hierarchical_pose_se3_torsion",
+        "hierarchical_pose_se3_torsion_flow",
+        "rigid_fragment", "rigid_fragment_flow",
+        "hierarchical_pose_rigid_fragment",
+        "hierarchical_pose_rigid_fragment_flow",
     }
     is_cartesian_flow = generation_method in {
         "flow", "rectified_flow", "flow_matching",
@@ -180,12 +254,38 @@ def main() -> None:
         flow_base_scale = None
     model = build_model(model_config).to(device)
     model.load_state_dict(payload["model"] if "model" in payload else payload)
+    if args.torsion_base_scale is not None:
+        if not hasattr(model, "torsion_base_scale"):
+            parser.error("--torsion-base-scale requires an SE(3)+torsion checkpoint")
+        model.torsion_base_scale = float(args.torsion_base_scale)
+    if args.torsion_step_limit_deg is not None:
+        if not hasattr(model, "torsion_step_limit"):
+            parser.error("--torsion-step-limit-deg requires an SE(3)+torsion checkpoint")
+        model.torsion_step_limit = math.radians(float(args.torsion_step_limit_deg))
+    if args.torsion_confidence_threshold is not None:
+        if not hasattr(model, "fragment_torsion_head"):
+            parser.error(
+                "--torsion-confidence-threshold requires a rigid-fragment checkpoint"
+            )
+        threshold = float(args.torsion_confidence_threshold)
+        if not 0.0 < threshold < 1.0:
+            parser.error("--torsion-confidence-threshold must be between zero and one")
+        model.fragment_torsion_head.confidence_threshold = threshold
+    if args.translation_step_limit is not None:
+        if not hasattr(model, "translation_step_limit"):
+            parser.error("--translation-step-limit requires an SE(3)+torsion checkpoint")
+        model.translation_step_limit = float(args.translation_step_limit)
+    if args.rotation_step_limit_deg is not None:
+        if not hasattr(model, "rotation_step_limit"):
+            parser.error("--rotation-step-limit-deg requires an SE(3)+torsion checkpoint")
+        model.rotation_step_limit = math.radians(float(args.rotation_step_limit_deg))
     model.eval()
     if "aligned_cache_dir" in config["data"]:
         dataset = MISATOAlignedDataset(
             config["data"]["aligned_cache_dir"],
             split,
             config["data"].get("topology_cache_dir"),
+            config["data"].get("qm_hdf5"),
         )
     else:
         dataset = MISATOProcessedDataset(config["data"]["root"], split)
@@ -269,6 +369,14 @@ def main() -> None:
                 metrics = compute_all_metrics(pred=prediction, **common)
                 persistence = batch["history"][offset, -1, :n_ligand].unsqueeze(0)
                 persistence = persistence.expand_as(prediction)
+                metrics.update(
+                    fragment_motion_metrics(
+                        prediction,
+                        target.to(device),
+                        batch["history"][offset, -1, :n_ligand],
+                        raw,
+                    )
+                )
                 persistence_world_metrics = {}
                 if predicted_pose_delta is not None:
                     future_steps = target.shape[0]
@@ -400,6 +508,14 @@ def main() -> None:
                         }
                     )
                 persistence_metrics = compute_all_metrics(pred=persistence, **common)
+                persistence_metrics.update(
+                    fragment_motion_metrics(
+                        persistence,
+                        target.to(device),
+                        batch["history"][offset, -1, :n_ligand],
+                        raw,
+                    )
+                )
                 persistence_metrics.update(persistence_world_metrics)
                 identifier = (
                     dataset.identifiers[index]
@@ -445,6 +561,20 @@ def main() -> None:
         "sampling_steps": sampling_steps,
         "internal_deformation_scale": internal_deformation_scale,
         "flow_base_scale": flow_base_scale,
+        "torsion_base_scale": getattr(model, "torsion_base_scale", None),
+        "torsion_step_limit_deg": (
+            math.degrees(model.torsion_step_limit)
+            if hasattr(model, "torsion_step_limit") else None
+        ),
+        "torsion_confidence_threshold": (
+            model.fragment_torsion_head.confidence_threshold
+            if hasattr(model, "fragment_torsion_head") else None
+        ),
+        "translation_step_limit": getattr(model, "translation_step_limit", None),
+        "rotation_step_limit_deg": (
+            math.degrees(model.rotation_step_limit)
+            if hasattr(model, "rotation_step_limit") else None
+        ),
         "pose_translation_scale": args.pose_translation_scale,
         "pose_rotation_scale": args.pose_rotation_scale,
         "rigid_internal_projection": bool(

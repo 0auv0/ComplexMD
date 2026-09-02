@@ -230,13 +230,15 @@ def project_velocity(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     basis_f = basis.float()
     velocity_f = velocity.float()
-    gram = torch.einsum("bncd,bnce->bde", basis_f, basis_f)
-    rhs = torch.einsum("bncd,bnc->bd", basis_f, velocity_f)
+    # CUDA autocast may downcast einsum even when its inputs were explicitly
+    # promoted. Cast the assembled normal equations back to FP32 before solve.
+    gram = torch.einsum("bncd,bnce->bde", basis_f, basis_f).float()
+    rhs = torch.einsum("bncd,bnc->bd", basis_f, velocity_f).float()
     valid = generalized_mask.float()
     diagonal = regularization * valid + (1.0 - valid)
     gram = gram + torch.diag_embed(diagonal)
     coefficients = torch.linalg.solve(gram, rhs.unsqueeze(-1)).squeeze(-1) * valid
-    projected = torch.einsum("bncd,bd->bnc", basis_f, coefficients)
+    projected = torch.einsum("bncd,bd->bnc", basis_f, coefficients).float()
     return coefficients.to(velocity.dtype), projected.to(velocity.dtype)
 
 
