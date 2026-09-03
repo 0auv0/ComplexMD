@@ -370,6 +370,17 @@ def build_goai_model_batch(
         if topology is not None:
             torsions = topology["torsion_bond"].shape[0]
             bonds = topology["bond_index"].shape[0]
+            fragment_count = int(topology["rigid_fragment_count"])
+            # QM.hdf5 supplies chemistry-aware hybridisation during MISATO
+            # training. Anonymous GOAI inputs only guarantee PDB connectivity,
+            # so use the embedding's reserved unknown/padding class instead of
+            # requiring an external molecule lookup. The fragment mask is a
+            # batching field and can be derived exactly from the inferred
+            # fragment count.
+            ligand_hybridisation = topology.get(
+                "ligand_hybridisation",
+                torch.zeros(ligand_z.numel(), dtype=torch.long),
+            )
             result.update(
                 {
                     "bond_index": topology["bond_index"].unsqueeze(0),
@@ -381,6 +392,10 @@ def build_goai_model_batch(
                     "torsion_root": topology["torsion_root"].unsqueeze(0),
                     "rigid_fragment": topology["rigid_fragment"].unsqueeze(0),
                     "rigid_fragment_count": topology["rigid_fragment_count"].unsqueeze(0),
+                    "rigid_fragment_mask": torch.ones(
+                        1, fragment_count, dtype=torch.bool
+                    ),
+                    "ligand_hybridisation": ligand_hybridisation.unsqueeze(0),
                 }
             )
     return result

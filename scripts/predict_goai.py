@@ -74,6 +74,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-root", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--manifest-dir",
+        help=(
+            "Optional directory for diagnostic manifests. By default each manifest "
+            "is written beside the tier predictions."
+        ),
+    )
     parser.add_argument("--tier", choices=["T1", "T2", "T3", "T4"], required=True)
     parser.add_argument("--ids", nargs="*")
     parser.add_argument("--max-systems", type=int)
@@ -255,7 +262,8 @@ def main() -> None:
         )
         print(f"[{index + 1}/{len(selected)}] wrote {output_path}", flush=True)
 
-    manifest = output_root / args.tier / "prediction_manifest.json"
+    manifest_root = Path(args.manifest_dir) if args.manifest_dir else output_root
+    manifest = manifest_root / args.tier / "prediction_manifest.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps(records, indent=2))
     print(f"saved {manifest}")

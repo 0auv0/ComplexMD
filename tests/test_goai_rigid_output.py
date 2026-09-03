@@ -7,6 +7,7 @@ import torch
 from bindmd.data.goai import (
     CanonicalGOAI,
     GOAISystem,
+    build_goai_model_batch,
     fragment_project_ligand,
     future_reference_poses,
     restore_full_complex,
@@ -109,6 +110,20 @@ def test_fragment_projection_retains_internal_heavy_motion() -> None:
         projected[3] - canonical.ligand_template_canonical[3],
         target_heavy[0] - canonical.ligand_template_canonical[0],
     )
+
+
+def test_conect_batch_supplies_fragment_head_fields_without_qm_hdf5() -> None:
+    canonical = synthetic_canonical()
+    batch = build_goai_model_batch(
+        canonical, history_frames=12, topology_source="conect"
+    )
+    assert batch["ligand_hybridisation"].shape == (1, 3)
+    assert torch.count_nonzero(batch["ligand_hybridisation"]) == 0
+    assert batch["rigid_fragment_mask"].shape == (
+        1,
+        int(batch["rigid_fragment_count"][0]),
+    )
+    assert batch["rigid_fragment_mask"].all()
 
 
 def test_hold_last_restores_rigid_protein_and_atom_order() -> None:

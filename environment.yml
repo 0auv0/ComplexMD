@@ -1,19 +1,21 @@
-name: complexmd
+name: complexmd-goai
 channels:
   - pytorch
   - nvidia
-  - pyg
   - conda-forge
 dependencies:
-  - python=3.9.25
+  - python=3.9
   - pytorch=2.2.0
   - pytorch-cuda=12.1
-  - pyg=2.5.2
   - numpy=1.26.4
   - pyyaml=6.0.2
+  - tqdm=4.67.1
   - h5py=3.14.0
   - mdanalysis=2.7.0
-  - tqdm=4.67.1
   - pytest=8.3.5
+  - setuptools=72.1.0
+  - wheel=0.45.1
   - pip
-
+  - pip:
+      - torch-geometric==2.5.2
+      - -e .
